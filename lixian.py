@@ -47,10 +47,163 @@ class Logger:
 
 logger = Logger()
 
-class XunleiClient:
-	page_size = 100
-	bt_page_size = 9999
+class WithAttrSnapshot:
+	def __init__(self, object, **attrs):
+		self.object = object
+		self.attrs = attrs
+	def __enter__(self):
+		self.old_attrs = []
+		for k in self.attrs:
+			if hasattr(self.object, k):
+				self.old_attrs.append((k, True, getattr(self.object, k)))
+			else:
+				self.old_attrs.append((k, False, None))
+		for k in self.attrs:
+			setattr(self.object, k, self.attrs[k])
+	def __exit__(self, exc_type, exc_val, exc_tb):
+		for k, has_old_attr, v in self.old_attrs:
+			if has_old_attr:
+				setattr(self.object, k, v)
+			else:
+				delattr(self.object, k)
+
+class WithAttr:
+	def __init__(self, object):
+		self.object = object
+	def __call__(self, **kwargs):
+		return WithAttrSnapshot(self.object, **kwargs)
+	def __getattr__(self, k):
+		return lambda (v): WithAttrSnapshot(self.object, **{k:v})
+
+# TODO: write unit test
+class OnDemandTaskList:
+	def __init__(self, fetch_page, page_size, limit):
+		self.fetch_page = fetch_page
+		if limit and page_size > limit:
+			page_size = limit
+		self.page_size = page_size
+		self.limit = limit
+		self.pages = {}
+		self.max_task_number = None
+		self.real_total_task_number = None
+		self.total_pages = None
+
+	def is_out_of_range(self, n):
+		if self.limit:
+			if n >= self.limit:
+				return True
+		if self.max_task_number:
+			if n >= self.max_task_number:
+				return True
+		if self.real_total_task_number:
+			if n >= self.real_total_task_number:
+				return True
+
+	def check_out_of_range(self, n):
+		if self.is_out_of_range(n):
+			raise IndexError('task index out of range')
+
+	def is_out_of_page(self, page):
+		raise NotImplementedError()
+
+	def get_nth_task(self, n):
+		self.check_out_of_range(n)
+		page = n / self.page_size
+		n_in_page = n - page * self.page_size
+		return self.hit_page(page)[n_in_page]
+
+	def touch(self):
+		self.hit_page(0)
+
+	def hit_page(self, page):
+		if page in self.pages:
+			return self.pages[page]
+		info = self.fetch_page(page, self.page_size)
+		tasks = info['tasks']
+		if self.max_task_number is None:
+			self.max_task_number = info['total_task_number']
+			if self.limit and self.max_task_number > self.limit:
+				self.max_task_number = self.limit
+			self.total_pages = self.max_task_number / self.page_size
+			if self.max_task_number % self.page_size != 0:
+				self.total_pages += 1
+			if self.max_task_number == 0:
+				self.real_total_task_number = 0
+		if page >= self.total_pages:
+			tasks = []
+		elif page == self.total_pages - 1:
+			if self.page_size * page + len(tasks) > self.max_task_number:
+				tasks = tasks[0:self.max_task_number - self.page_size * page]
+			if len(tasks) > 0:
+				self.real_total_task_number = self.page_size * page + len(tasks)
+			else:
+				self.max_task_number -= self.page_size
+				self.total_pages -= 1
+				if len(self.pages.get(page-1, [])) == self.page_size:
+					self.real_total_task_number = self.max_task_number
+		else:
+			if len(tasks) == 0:
+				self.max_task_number = self.page_size * page
+				self.total_pages = page
+				if len(self.pages.get(page-1, [])) == self.page_size:
+					self.real_total_task_number = self.max_task_number
+			elif len(tasks) < self.page_size:
+				self.real_total_task_number = self.page_size * page + len(tasks)
+				self.max_task_number = self.real_total_task_number
+				self.total_pages = page
+			else:
+				pass
+		for i, t in enumerate(tasks):
+			t['#'] = self.page_size * page + i
+		self.pages[page] = tasks
+		return tasks
+
+	def __getitem__(self, n):
+		return self.get_nth_task(n)
+
+	def __iter__(self):
+		class Iterator:
+			def __init__(self, container):
+				self.container = container
+				self.current = 0
+			def next(self):
+				self.container.touch()
+				assert type(self.container.max_task_number) == int
+				if self.container.real_total_task_number is None:
+					if self.current < self.container.max_task_number:
+						try:
+							task = self.container[self.current]
+						except IndexError:
+							raise StopIteration()
+					else:
+						raise StopIteration()
+				else:
+					if self.current < self.container.real_total_task_number:
+						task = self.container[self.current]
+					else:
+						raise StopIteration()
+				self.current += 1
+				return task
+		return Iterator(self)
+
+	def __len__(self):
+		if self.real_total_task_number:
+			return self.real_total_task_number
+		self.touch()
+		self.hit_page(self.total_pages-1)
+		if self.real_total_task_number:
+			return self.real_total_task_number
+		count = 0
+		for t in self:
+			count += 1
+		return count
+
+class XunleiClient(object):
+	default_page_size = 100
+	default_bt_page_size = 9999
 	def __init__(self, username=None, password=None, cookie_path=None, login=True, verification_code_reader=None):
+		self.attr = WithAttr(self)
+
 		self.username = username
 		self.password = password
 		self.cookie_path = cookie_path
@@ -60,14 +213,28 @@ class XunleiClient:
 				self.load_cookies()
 		else:
 			self.cookiejar = cookielib.CookieJar()
-		self.set_page_size(self.page_size)
+
+		self.page_size = self.default_page_size
+		self.bt_page_size = self.default_bt_page_size
+
+		self.limit = None
+
 		self.opener = urllib2.build_opener(urllib2.HTTPCookieProcessor(self.cookiejar))
 		self.verification_code_reader = verification_code_reader
+		self.login_time = None
 		if login:
-			if not self.has_logged_in():
+			self.id = self.get_userid_or_none()
+			if not self.id:
 				self.login()
-			else:
-				self.id = self.get_userid()
+			self.id = self.get_userid()
+
+	@property
+	def page_size(self):
+		return self._page_size
+	@page_size.setter
+	def page_size(self, size):
+		self._page_size = size
+		self.set_page_size(size)
 
 	@retry
 	def urlopen(self, url, **args):
@@ -166,18 +333,33 @@ class XunleiClient:
 		if not id:
 			return False
 		#print self.urlopen('http://dynamic.cloud.vip.xunlei.com/user_task?userid=%s&st=0' % id).read().decode('utf-8')
-		self.set_page_size(1)
-		url = 'http://dynamic.cloud.vip.xunlei.com/user_task?userid=%s&st=0' % id
-		#url = 'http://dynamic.lixian.vip.xunlei.com/login?cachetime=%d' % current_timestamp()
-		r = self.is_login_ok(self.urlread(url))
-		self.set_page_size(self.page_size)
-		return r
+		with self.attr(page_size=1):
+			url = 'http://dynamic.cloud.vip.xunlei.com/user_task?userid=%s&st=0' % id
+			#url = 'http://dynamic.lixian.vip.xunlei.com/login?cachetime=%d' % current_timestamp()
+			r = self.is_login_ok(self.urlread(url))
+			return r
 
 	def is_session_timeout(self, html):
-		is_timeout = html == '''<script>document.cookie ="sessionid=; path=/; domain=xunlei.com"; document.cookie ="lx_sessionid=; path=/; domain=vip.xunlei.com";top.location='http://cloud.vip.xunlei.com/task.html?error=1'</script>''' or html == '''<script>document.cookie ="sessionid=; path=/; domain=xunlei.com"; document.cookie ="lsessionid=; path=/; domain=xunlei.com"; document.cookie ="lx_sessionid=; path=/; domain=vip.xunlei.com";top.location='http://cloud.vip.xunlei.com/task.html?error=2'</script>'''
+		is_timeout = html == '''<script>document.cookie ="sessionid=; path=/; domain=xunlei.com"; document.cookie ="lx_sessionid=; path=/; domain=vip.xunlei.com";top.location='http://cloud.vip.xunlei.com/task.html?error=1'</script>''' or html == '''<script>document.cookie ="sessionid=; path=/; domain=xunlei.com"; document.cookie ="lsessionid=; path=/; domain=xunlei.com"; document.cookie ="lx_sessionid=; path=/; domain=vip.xunlei.com";top.location='http://cloud.vip.xunlei.com/task.html?error=2'</script>''' or html == '''<script>document.cookie ="sessionid=; path=/; domain=xunlei.com"; document.cookie ="lsessionid=; path=/; domain=xunlei.com"; document.cookie ="lx_sessionid=; path=/; domain=vip.xunlei.com";document.cookie ="lx_login=; path=/; domain=vip.xunlei.com";top.location='http://cloud.vip.xunlei.com/task.html?error=1'</script>'''
 		if is_timeout:
 			logger.trace(html)
+			return True
+		maybe_timeout = html == '''rebuild({"rtcode":-1,"list":[]})'''
+		if maybe_timeout:
+			if self.login_time and time.time() - self.login_time < 60 * 10: # 10 minutes
+				return False
+			else:
+				logger.trace(html)
+				return True
 		return is_timeout
+
+	def read_verification_code(self):
+		if not self.verification_code_reader:
+			raise NotImplementedError('Verification code required')
+		else:
+			verification_code_url = 'http://verify.xunlei.com/image?cachetime=%s' % current_timestamp()
+			image = self.urlopen(verification_code_url).read()
+			return self.verification_code_reader(image)
 
 	def login(self, username=None, password=None):
 		username = self.username
@@ -199,26 +381,21 @@ class XunleiClient:
 		login_page = self.urlopen(check_url).read()
 		verification_code = self.get_cookie('.xunlei.com', 'check_result')[2:].upper()
 		if not verification_code:
-			if not self.verification_code_reader:
-				raise NotImplementedError('Verification code required')
-			else:
-				verification_code_url = 'http://verify2.xunlei.com/image?cachetime=%s' % current_timestamp()
-				image = self.urlopen(verification_code_url).read()
-				verification_code = self.verification_code_reader(image)
-				if verification_code:
-					verification_code = verification_code.upper()
+			verification_code = self.read_verification_code()
+			if verification_code:
+				verification_code = verification_code.upper()
 		assert verification_code
 		password = encypt_password(password)
 		password = md5(password+verification_code)
 		login_page = self.urlopen('http://login.xunlei.com/sec2login/', data={'u': username, 'p': password, 'verifycode': verification_code})
 		self.id = self.get_userid()
-		self.set_page_size(1)
-		login_page = self.urlopen('http://dynamic.lixian.vip.xunlei.com/login?cachetime=%d&from=0'%current_timestamp()).read()
-		self.set_page_size(self.page_size)
+		with self.attr(page_size=1):
+			login_page = self.urlopen('http://dynamic.lixian.vip.xunlei.com/login?cachetime=%d&from=0'%current_timestamp()).read()
 		if not self.is_login_ok(login_page):
 			logger.trace(login_page)
 			raise RuntimeError('login failed')
 		self.save_cookies()
+		self.login_time = time.time()
 
 	def logout(self):
 		logger.debug('logout')
@@ -235,9 +412,21 @@ class XunleiClient:
 		for k in ckeys1:
 			self.set_cookie('.xunlei.com', k, '')
 		self.save_cookies()
+		self.login_time = None
+
+	def to_page_url(self, type_id, page_index, page_size):
+		# type_id: 1 for downloading, 2 for completed, 4 for downloading+completed+expired, 11 for deleted, 13 for expired
+		if type_id == 0:
+			type_id = 4
+		page = page_index + 1
+		p = 1 # XXX: what is it?
+		# jsonp = 'jsonp%s' % current_timestamp()
+		# url = 'http://dynamic.cloud.vip.xunlei.com/interface/showtask_unfresh?type_id=%s&page=%s&tasknum=%s&p=%s&interfrom=task&callback=%s' % (type_id, page, page_size, p, jsonp)
+		url = 'http://dynamic.cloud.vip.xunlei.com/interface/showtask_unfresh?type_id=%s&page=%s&tasknum=%s&p=%s&interfrom=task' % (type_id, page, page_size, p)
+		return url
 
 	@retry(10)
-	def read_task_page_url(self, url):
+	def read_task_page_info_by_url(self, url):
 		page = self.urlread(url).decode('utf-8', 'ignore')
 		data = parse_json_response(page)
 		if not self.has_gdriveid():
@@ -248,49 +437,60 @@ class XunleiClient:
 		tasks = [t for t in parse_json_tasks(data) if not t['expired']]
 		for t in tasks:
 			t['client'] = self
-		current_page = int(re.search(r'page=(\d+)', url).group(1))
+		# current_page = int(re.search(r'page=(\d+)', url).group(1))
 		total_tasks = int(data['info']['total_num'])
-		total_pages = total_tasks / self.page_size
-		if total_tasks % self.page_size != 0:
-			total_pages += 1
-		if total_pages == 0:
-			total_pages = 1
-		assert total_pages >= data['global_new']['page'].count('<li><a')
-		if current_page < total_pages:
-			next = re.sub(r'page=(\d+)', 'page=%d' % (current_page + 1), url)
-		else:
-			next = None
-		return tasks, next
+		# assert total_pages >= data['global_new']['page'].count('<li><a')
+		return {'tasks': tasks, 'total_task_number': total_tasks}
 
-	def read_task_page(self, type_id, page=1):
-		# type_id: 1 for downloading, 2 for completed, 4 for downloading+completed+expired, 11 for deleted, 13 for expired
-		if type_id == 0:
-			type_id = 4
-		page_size = self.page_size
-		p = 1 # XXX: what is it?
-		# jsonp = 'jsonp%s' % current_timestamp()
-		# url = 'http://dynamic.cloud.vip.xunlei.com/interface/showtask_unfresh?type_id=%s&page=%s&tasknum=%s&p=%s&interfrom=task&callback=%s' % (type_id, page, page_size, p, jsonp)
-		url = 'http://dynamic.cloud.vip.xunlei.com/interface/showtask_unfresh?type_id=%s&page=%s&tasknum=%s&p=%s&interfrom=task' % (type_id, page, page_size, p)
-		return self.read_task_page_url(url)
+	def read_task_page_info_by_page_index(self, type_id, page_index, page_size):
+		return self.read_task_page_info_by_url(self.to_page_url(type_id, page_index, page_size))
 
 	def read_tasks(self, type_id=0):
 		'''read one page'''
-		tasks = self.read_task_page(type_id)[0]
+		page_size = self.page_size
+		limit = self.limit
+		if limit and limit < page_size:
+			page_size = limit
+		first_page = self.read_task_page_info_by_page_index(type_id, 0, page_size)
+		tasks = first_page['tasks']
 		for i, task in enumerate(tasks):
 			task['#'] = i
 		return tasks
 
-	def read_all_tasks(self, type_id=0):
+	def read_all_tasks_immediately(self, type_id):
 		'''read all pages'''
 		all_tasks = []
-		tasks, next_link = self.read_task_page(type_id)
-		all_tasks.extend(tasks)
-		while next_link:
-			tasks, next_link = self.read_task_page_url(next_link)
-			all_tasks.extend(tasks)
+		page_size = self.page_size
+		limit = self.limit
+		if limit and limit < page_size:
+			page_size = limit
+		first_page = self.read_task_page_info_by_page_index(type_id, 0, page_size)
+		all_tasks.extend(first_page['tasks'])
+		total_tasks = first_page['total_task_number']
+		if limit and limit < total_tasks:
+			total_tasks = limit
+		total_pages = total_tasks / page_size
+		if total_tasks % page_size != 0:
+			total_pages += 1
+		if total_pages == 0:
+			total_pages = 1
+		for page_index in range(1, total_pages):
+			current_page = self.read_task_page_info_by_page_index(type_id, 0, page_size)
+			all_tasks.extend(current_page['tasks'])
+		if limit:
+			all_tasks = all_tasks[0:limit]
 		for i, task in enumerate(all_tasks):
 			task['#'] = i
 		return all_tasks
+
+	def read_all_tasks_on_demand(self, type_id):
+		'''read all pages, lazily'''
+		fetch_page = lambda page_index, page_size: self.read_task_page_info_by_page_index(type_id, page_index, page_size)
+		return OnDemandTaskList(fetch_page, self.page_size, self.limit)
+
+	def read_all_tasks(self, type_id=0):
+		'''read all pages'''
+		return self.read_all_tasks_on_demand(type_id)
 
 	def read_completed(self):
 		'''read first page of completed tasks'''
@@ -359,8 +559,12 @@ class XunleiClient:
 		tasks, next_link = self.read_history_page(type)
 		all_tasks.extend(tasks)
 		while next_link:
+			if self.limit and len(all_tasks) > self.limit:
+				break
 			tasks, next_link = self.read_history_page_url(next_link)
 			all_tasks.extend(tasks)
+		if self.limit:
+			all_tasks = all_tasks[0:self.limit]
 		for i, task in enumerate(all_tasks):
 			task['#'] = i
 		return all_tasks
@@ -380,9 +584,8 @@ class XunleiClient:
 	def list_bt(self, task):
 		assert task['type'] == 'bt'
 		url = 'http://dynamic.cloud.vip.xunlei.com/interface/fill_bt_list?callback=fill_bt_list&tid=%s&infoid=%s&g_net=1&p=1&uid=%s&noCacheIE=%s' % (task['id'], task['bt_hash'], self.id, current_timestamp())
-		self.set_page_size(self.bt_page_size)
-		html = remove_bom(self.urlread(url)).decode('utf-8')
-		self.set_page_size(self.page_size)
+		with self.attr(page_size=self.bt_page_size):
+			html = remove_bom(self.urlread(url)).decode('utf-8')
 		sub_tasks = parse_bt_list(html)
 		for t in sub_tasks:
 			t['date'] = task['date']
@@ -475,20 +678,40 @@ class XunleiClient:
 			data['cid[%d]' % i] = ''
 			data['url[%d]' % i] = urllib.quote(to_utf_8(urls[i])) # fix per request #98
 		data['batch_old_taskid'] = batch_old_taskid
+		data['verify_code'] = ''
 		response = self.urlread(url, data=data)
-		assert_response(response, jsonp, len(urls))
+
+		code = get_response_code(response, jsonp)['process']
+		while code == -12 or code == -11:
+			verification_code = self.read_verification_code()
+			assert verification_code
+			data['verify_code'] = verification_code
+			response = self.urlread(url, data=data)
+			code = get_response_code(response, jsonp)
+		if code == len(urls):
+			return
+		else:
+			assert code == len(urls), 'invalid response code: %s' % code
+
+	def commit_torrent_task(self, data):
+		jsonp = 'jsonp%s' % current_timestamp()
+		commit_url = 'http://dynamic.cloud.vip.xunlei.com/interface/bt_task_commit?callback=%s' % jsonp
+		response = self.urlread(commit_url, data=data)
+		code = get_response_code(response, jsonp)['progress']
+		while code == -12 or code == -11:
+			verification_code = self.read_verification_code()
+			assert verification_code
+			data['verify_code'] = verification_code
+			response = self.urlread(commit_url, data=data)
+			code = get_response_code(response, jsonp)['progress']
 
 	def add_torrent_task_by_content(self, content, path='attachment.torrent'):
 		assert re.match(r'd\d+:', content), 'Probably not a valid content file [%s...]' % repr(content[:17])
 		upload_url = 'http://dynamic.cloud.vip.xunlei.com/interface/torrent_upload'
-		jsonp = 'jsonp%s' % current_timestamp()
-		commit_url = 'http://dynamic.cloud.vip.xunlei.com/interface/bt_task_commit?callback=%s' % jsonp
-
 		content_type, body = encode_multipart_formdata([], [('filepath', path, content)])
-
 		response = self.urlread(upload_url, data=body, headers={'Content-Type': content_type}).decode('utf-8')
 
-		upload_success = re.search(r'<script>document\.domain="xunlei\.com";var btResult =(\{.*\});var btRtcode = 0</script>', response, flags=re.S)
+		upload_success = re.search(r'<script>document\.domain="xunlei\.com";var btResult =(\{.*\});</script>', response, flags=re.S)
 		if upload_success:
 			bt = json.loads(upload_success.group(1))
 			bt_hash = bt['infoid']
@@ -498,17 +721,14 @@ class XunleiClient:
 					'findex':''.join(f['id']+'_' for f in bt['filelist']),
 					'size':''.join(f['subsize']+'_' for f in bt['filelist']),
 					'from':'0'}
-			response = self.urlread(commit_url, data=data)
-			#assert_response(response, jsonp)
-			# skip response check
-			# assert re.match(r'%s\({"id":"\d+","avail_space":"\d+","progress":1}\)' % jsonp, response), repr(response)
+			self.commit_torrent_task(data)
 			return bt_hash
-		already_exists = re.search(r"parent\.edit_bt_list\((\{.*\}),''\)", response, flags=re.S)
+		already_exists = re.search(r"parent\.edit_bt_list\((\{.*\}),'','0'\)", response, flags=re.S)
 		if already_exists:
 			bt = json.loads(already_exists.group(1))
 			bt_hash = bt['infoid']
 			return bt_hash
-		raise NotImplementedError()
+		raise NotImplementedError(response)
 
 	def add_torrent_task_by_info_hash(self, sha1):
 		return self.add_torrent_task_by_content(self.get_torrent_file_by_info_hash(sha1), sha1.upper()+'.torrent')
@@ -519,7 +739,7 @@ class XunleiClient:
 
 	def add_torrent_task_by_info_hash2(self, sha1, old_task_id=None):
 		'''similar to add_torrent_task_by_info_hash, but faster. I may delete current add_torrent_task_by_info_hash completely in future'''
-		link = 'http://dynamic.cloud.vip.xunlei.com/interface/get_torrent?userid=%s&infoid=%s' % (self.id, sha1)
+		link = 'http://dynamic.cloud.vip.xunlei.com/interface/get_torrent?userid=%s&infoid=%s' % (self.id, sha1.upper())
 		return self.add_torrent_task_by_link(link, old_task_id=old_task_id)
 
 	def add_magnet_task(self, link):
@@ -528,7 +748,7 @@ class XunleiClient:
 	def add_torrent_task_by_link(self, link, old_task_id=None):
 		url = 'http://dynamic.cloud.vip.xunlei.com/interface/url_query?callback=queryUrl&u=%s&random=%s' % (urllib.quote(link), current_timestamp())
 		response = self.urlread(url)
-		success = re.search(r'queryUrl(\(1,.*\))\s*$', response, flags=re.S)
+		success = re.search(r'queryUrl(\(1,.*\))\s*$', response, flags=re.S) # XXX: sometimes it returns queryUrl(0,...)?
 		if not success:
 			already_exists = re.search(r"queryUrl\(-1,'([^']{40})", response, flags=re.S)
 			if already_exists:
@@ -549,12 +769,7 @@ class XunleiClient:
 		if old_task_id:
 			data['o_taskid'] = old_task_id
 			data['o_page'] = 'history'
-		jsonp = 'jsonp%s' % current_timestamp()
-		commit_url = 'http://dynamic.cloud.vip.xunlei.com/interface/bt_task_commit?callback=%s' % jsonp
-		response = self.urlread(commit_url, data=data)
-		#assert_response(response, jsonp)
-		# skip response check
-		# assert re.match(r'%s\({"id":"\d+","avail_space":"\d+","progress":1}\)' % jsonp, response), repr(response)
+		self.commit_torrent_task(data)
 		return cid
 
 	def readd_all_expired_tasks(self):
@@ -638,6 +853,7 @@ def current_random():
 
 def convert_task(data):
 	expired = {'0':False, '4': True}[data['flag']]
+	assert re.match(r'[^:]+', data['url']), 'Invalid URL in: ' + repr(data)
 	task = {'id': data['id'],
 			'type': re.match(r'[^:]+', data['url']).group().lower(),
 			'name': unescape_html(data['taskname']),
@@ -789,6 +1005,18 @@ def remove_bom(response):
 def assert_response(response, jsonp, value=1):
 	response = remove_bom(response)
 	assert response == '%s(%s)' % (jsonp, value), repr(response)
+
+def get_response_code(response, jsonp):
+	response = remove_bom(response)
+	m = re.match(r'^%s\((.+)\)$' % jsonp, response)
+	assert m, 'invalid jsonp response: %s' % response
+	logger.trace('get_response_code')
+	logger.trace(response)
+	parameter = m.group(1)
+	m = re.match(r"^\{process:(-?\d+),msg:'(.*)'\}$", parameter)
+	if m:
+		return {'process': int(m.group(1)), 'msg': m.group(2)}
+	return json.loads(parameter)
 
 def parse_url_protocol(url):
 	m = re.match(r'([^:]+)://', url)
